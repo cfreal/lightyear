@@ -12,18 +12,15 @@ To use, implement the `Remote.oracle()` method in `remote.py`.
 
 from __future__ import annotations
 from abc import abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache, cached_property
 from itertools import product
 from dataclasses import dataclass, field
-import queue
-from threading import Thread
 import zlib
-import threading
-from typing import Literal
 
 from rich.live import Live
 from rich.text import Text
-from rich.console import Group
+from rich.console import Group, RenderableType
 
 from ten import *
 
@@ -112,7 +109,6 @@ class Exploit:
         if output.exists():
             self._handle_resume()
         self._handle = output.open("wb")
-        self._write_output()
 
     def _handle_resume(self) -> None:
         data = self.data_handler.resume(self.output)
@@ -156,17 +152,42 @@ class Exploit:
         filters = self.data_handler.edit_filters(filters)
         return self.remote.has_contents(filters, self.path)
 
-    def data_string(self) -> str:
-        base64_string = self.base64_string()
-        return self.data_handler.for_display(base64_string)
+    def store_and_display_data(self, done: bool=False, interrupted: bool=False) -> None:
+        """Updates the CLI and saves the data to a file if required."""
+        b64 = self.base64_string()
+        info = []
+        info.append(("digits", len(b64)))
+        
+        word = done and "Dumped" or "Dumping"
+            
+        if self.output:
+            message = f"{word} [b]{self.path}[/b] to [b]{self.output}[/b]"
+            data = self.data_handler.for_output(b64)
 
-    def _get_renderable(self) -> Group:
-        nb_digits = len(self.digits) - 1
-        string = self.data_string()
-        nb_chars = len(string)
+            self._handle.seek(0)
+            nb_bytes = self._handle.write(data)
+            self._handle.flush()
+            info.append(("bytes", nb_bytes))
+        else:
+            message = f"{word} [b]{self.path}[/b]"
+        
+        if self._display:
+            string = self.data_handler.for_display(b64)
+            nb_chars = len(string)
+            info.append(("chars", nb_chars))
 
-        prefix = f"[black b]>>[/] [u]Dumping [b]{self.path}[/b][/] (got [i]{nb_digits}[/i] digits, [i]{nb_chars}[/i] chars)"
-        return Group(Text(string), prefix)
+        info = ", ".join(f"[i]{nb}[/i] {type}" for type, nb in info)
+        message = f"[black b]>>[/] [u]{message}[/] (got {info})"
+        
+        if interrupted:
+            message = f"{message} [red b](interrupted)[/]"
+
+        if self._display:
+            output = Group(Text(string), message)
+        else:
+            output = message            
+
+        self.live.update(output)
 
     def _test_remote(self) -> None:
         """Tests that the remote class created by the user is working properly."""
@@ -210,57 +231,15 @@ class Exploit:
             msg_success("Use [code]-c[/] to enable compression.")
 
         leave()
-    
-    def _storer(self) -> None:
-        """A worker that stores the digits in the chain, in order."""
-        dq = self._digits_queue
         
-        while True:
-            i, value = dq.get()
-
-            if i > len(self.digits):
-                dq.put((i, value))
-                continue
-
-            if value is None:
-                break
-
-            self.digits.append(value)
-            self._positions_queue.put((i+4, i+4))
-            self._write_output()
-            
-            if self.live:
-                self.live.update(self._get_renderable())
-        
-    def _worker(self) -> None:
-        pq = self._positions_queue
-        
-        while True:
-            priority, index = pq.get()
-            
-            if index is None:
-                pq.put((MAX_INT, None))
-                break
-            
-            if self._eof_index and index >= self._eof_index:
-                continue
-            
-            digit = None
-            
+    def _worker(self, index: int) -> None:
+        while self._continue:
             try:
-                digit = self.get_digit(index)
+                return self.get_digit(index)
             except (NoJumpException, NoPathException):
-                pq.put((priority+1, index))
-                continue
-
-            if digit is None:
-                # print(i, "WE NONE")
-                with self._eof_index_lock:
-                    if self._eof_index is None or index < self._eof_index:
-                        self._eof_index = index
-                        pq.put((MAX_INT, None))
-
-            self._digits_queue.put((index, digit))
+                sleep(.01)
+        
+        return None
 
     def run(self) -> None:
         """Multithreaded digit dump: each worker gets a unique i, stops at EOF."""
@@ -277,58 +256,48 @@ class Exploit:
                 "anything out of it."
             )
 
-        interrupted = False
-        max_workers = self.nb_workers
-        
-        self._eof_index_lock = threading.Lock()
-        self._eof_index = None
-        self._positions_queue = queue.PriorityQueue()
-        self._digits_queue = queue.PriorityQueue()
-
-        if self._display:
-            self.live = Live(self._get_renderable(), console=get_console(), transient=True)
-            self.live.start()
-        else:
-            self.live = None
-                
-        for i in range(1,5):
-            self._positions_queue.put((i, i))
+        self.live = Live("-", console=get_console(), transient=False)
+        self.store_and_display_data()
+        self.live.start()
             
-        threads = [threading.Thread(target=self._worker) for _ in range(max_workers)]
-        threads.append(threading.Thread(target=self._storer))
+        self._continue = True
+        interrupted = False
         
-        try:
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+        try:            
+            with ThreadPoolExecutor(max_workers=self.nb_workers) as executor:
+                futures = {}
+                
+                def queue_digit(i):
+                    futures[i] = executor.submit(self._worker, i)
+                
+                # Queue the first 4 digits, as they can be obtained by swapping
+                
+                current_idx = len(self.digits)
+                for i in range(4):
+                    queue_digit(current_idx + i)
+
+                while True:
+                    digit = futures.pop(current_idx).result()
+
+                    # We reached EOF: exit
+                    if digit is None:
+                        break
+                    
+                    queue_digit(current_idx+4)
+                    
+                    self.digits.append(digit)
+                    self.store_and_display_data()
+                
+                    current_idx += 1
+                
+                # Ask workers to exit and cancel remaining futures
+                self._continue = False
+                executor.shutdown(cancel_futures=True)
         except KeyboardInterrupt:
-            self._positions_queue.put((0, None))
-            self._digits_queue.put((0, None))
+            interrupted = True
         finally:
-            if self.live:
-                self.live.stop()
-
-        if self._display:
-            data = self.data_string()
-            msg_print(Text(data))
-
-        if interrupted:
-            msg_failure("Execution interrupted (Ctrl-C)")
-
-        output = f" to [b]{self.output}[/]" if self.output else ""
-        msg_success(f"Dumped [b]{self.path}[/]{output}")
-
-    def _write_output(self) -> None:
-        if not self.output:
-            return
-
-        data = self.base64_string()
-        data = self.data_handler.for_output(data)
-
-        self._handle.seek(0)
-        self._handle.write(data)
-        self._handle.flush()
+            self.store_and_display_data(done=True, interrupted=interrupted)
+            self.live.stop()
 
     def base64_string(self) -> str:
         return "".join(digit.digit for digit in self.digits[1:])
