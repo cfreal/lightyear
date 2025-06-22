@@ -63,7 +63,7 @@ B64DE = (
     "compress",
     "If set, the file is retrieved in a compressed format, which is then decompressed before being dumped. This is faster, but it requires PHP to have the `zlib` extension enabled, and it displays data in chunks instead of character by character.",
 )
-@arg("workers", "Number of workers. Defaults to 2.")
+@arg("threads", "Number of threads. Defaults to 3.")
 @arg("silent", "If set, do not display the file as it is being dumped")
 @arg("debug", "If set, writes logs to debug.log")
 class Exploit:
@@ -86,12 +86,12 @@ class Exploit:
         path: str,
         output: str = None,
         compress: bool = False,
-        workers: int=2, silent: bool = False,
+        threads: int=3, silent: bool = False,
         debug: bool = False,
     ) -> None:
         self.path = path
         self.output = output
-        self.nb_workers = workers
+        self.nb_threads = threads
         self.debug = debug
         if compress:
             self.data_handler = ZlibCompressedDataHandler(self)
@@ -264,7 +264,7 @@ class Exploit:
         interrupted = False
         
         try:            
-            with ThreadPoolExecutor(max_workers=self.nb_workers) as executor:
+            with ThreadPoolExecutor(max_workers=self.nb_threads) as executor:
                 futures = {}
                 
                 def queue_digit(i):
