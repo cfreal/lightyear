@@ -17,6 +17,7 @@ from itertools import product
 from dataclasses import dataclass, field
 import queue
 from threading import Thread
+import zlib
 import threading
 from typing import Literal
 
@@ -81,6 +82,7 @@ class Exploit:
         REMOVE_EQUAL,
     )
     handler: DataHandler
+    live: Live
 
     def __init__(
         self,
@@ -208,6 +210,57 @@ class Exploit:
             msg_success("Use [code]-c[/] to enable compression.")
 
         leave()
+    
+    def _storer(self) -> None:
+        """A worker that stores the digits in the chain, in order."""
+        dq = self._digits_queue
+        
+        while True:
+            i, value = dq.get()
+
+            if i > len(self.digits):
+                dq.put((i, value))
+                continue
+
+            if value is None:
+                break
+
+            self.digits.append(value)
+            self._positions_queue.put((i+4, i+4))
+            self._write_output()
+            
+            if self.live:
+                self.live.update(self._get_renderable())
+        
+    def _worker(self) -> None:
+        pq = self._positions_queue
+        
+        while True:
+            priority, index = pq.get()
+            
+            if index is None:
+                pq.put((MAX_INT, None))
+                break
+            
+            if self._eof_index and index >= self._eof_index:
+                continue
+            
+            digit = None
+            
+            try:
+                digit = self.get_digit(index)
+            except (NoJumpException, NoPathException):
+                pq.put((priority+1, index))
+                continue
+
+            if digit is None:
+                # print(i, "WE NONE")
+                with self._eof_index_lock:
+                    if self._eof_index is None or index < self._eof_index:
+                        self._eof_index = index
+                        pq.put((MAX_INT, None))
+
+            self._digits_queue.put((index, digit))
 
     def run(self) -> None:
         """Multithreaded digit dump: each worker gets a unique i, stops at EOF."""
@@ -227,65 +280,22 @@ class Exploit:
         interrupted = False
         max_workers = self.nb_workers
         
-        next_index = len(self.digits)
-        next_index_lock = threading.Lock()
-        eof_index = [None]  # Use a list for mutability in threads
-        digits_lock = threading.Lock()
+        self._eof_index_lock = threading.Lock()
+        self._eof_index = None
+        self._positions_queue = queue.PriorityQueue()
+        self._digits_queue = queue.PriorityQueue()
 
         if self._display:
-            live = Live(self._get_renderable(), console=get_console(), transient=True)
-            live.start()
+            self.live = Live(self._get_renderable(), console=get_console(), transient=True)
+            self.live.start()
         else:
-            live = None
-            
-        digit_queue = queue.PriorityQueue()
-            
-        def storer():
-            while not interrupted:
-                try:
-                    i, value = digit_queue.get(timeout=.5)
-                except queue.Empty:
-                    continue
-                if i == len(self.digits):
-                    self.digits.append(value)
-                    self._write_output()
-                    if live:
-                        live.update(self._get_renderable())
-                else:
-                    digit_queue.put((i, value))
-
-
-        def worker():
-            nonlocal next_index
-
-            while not interrupted:
-                with next_index_lock:
-                    if eof_index[0] is not None and next_index >= eof_index[0]:
-                        break
-                    i = next_index
-                    next_index += 1
-
-                # print("LOOKING FOR DIGIT", i)
-                digit = None
+            self.live = None
                 
-                while not interrupted:
-                    try:
-                        digit = self.get_digit(i)
-                    except (NoJumpException, NoPathException):
-                        continue
-                    break
-                # print(i, "GOT DIGIT", digit)
-                if digit is None:
-                    # print(i, "WE NONE")
-                    with next_index_lock:
-                        if eof_index[0] is None or i < eof_index[0]:
-                            eof_index[0] = i
-                    break
-
-                digit_queue.put((digit.index, digit))
+        for i in range(1,5):
+            self._positions_queue.put((i, i))
             
-        threads = [threading.Thread(target=worker) for _ in range(max_workers)]
-        threads.append(threading.Thread(target=storer))
+        threads = [threading.Thread(target=self._worker) for _ in range(max_workers)]
+        threads.append(threading.Thread(target=self._storer))
         
         try:
             for t in threads:
@@ -293,10 +303,11 @@ class Exploit:
             for t in threads:
                 t.join()
         except KeyboardInterrupt:
-            interrupted = True
+            self._positions_queue.put((0, None))
+            self._digits_queue.put((0, None))
         finally:
-            if live:
-                live.stop()
+            if self.live:
+                self.live.stop()
 
         if self._display:
             data = self.data_string()
@@ -722,7 +733,7 @@ class JumpDescription:
     parent: PositionalDigit
     """The digit we jumped from."""
     filters: tuple[str]
-    """Filters used to get there."""
+    """Filters used to get there from `JumpDescription.parent`."""
     breakable_position: int
     """Position of the end of the chunk. If `None`, there is not limitation."""
     breakable_digit: Digit
@@ -769,8 +780,8 @@ class JumpDescription:
         return self.parent.get_safe_jump(target).filter_chain(target) + self.filters
 
     def distance(self, target: int) -> int:
-        """Returns the length of the filter chain to reach `target`. We're looking to
-        minimize this value.
+        """Returns the length of the filter chain required to reach `target`. We're 
+        looking to minimize this value.
         """
         return len("|".join(self.filter_chain(target)))
 
